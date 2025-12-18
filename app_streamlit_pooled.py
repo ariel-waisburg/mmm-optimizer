@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-App Streamlit: Optimizer usando Modelo Pooled (R² = 0.90) + Análisis ROAS/ROI
+App Streamlit: Optimizer usando Modelo Pooled (R² = 0.89) + Análisis ROAS/ROI
 Con análisis de saturación y punto óptimo de inversión
 """
 
@@ -506,9 +506,12 @@ def analyze_saturation(cliente, ticket_usd, model, df_hist, curvas_hill=None, ma
             continue
         
         # Optimizar SOLO la distribución para este presupuesto FIJO
+        # IMPORTANTE: force_full_budget=True para que la curva muestre qué pasa
+        # si realmente gastás ese presupuesto (no el óptimo dentro de ese límite)
         opt_result = optimize_distribution_for_fixed_budget(
             cliente, budget, ticket_usd, model, df_hist, curvas_hill, 
-            min_invest_meta=0, min_invest_gads=0, optimize_for='profit'
+            min_invest_meta=0, min_invest_gads=0, optimize_for='profit',
+            force_full_budget=True
         )
         
         results.append({
@@ -652,7 +655,7 @@ if page == "📁 Datos":
 # =============================================================================
 
 elif page == "🤖 Modelo Pooled":
-    st.header("🤖 Modelo Pooled (R² = 0.90)")
+    st.header("🤖 Modelo Pooled (R² = 0.89)")
     
     if model is None:
         st.error("❌ Modelo pooled no encontrado")
@@ -1059,7 +1062,7 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                     - Las predicciones pueden no ser precisas
                     
                     **¿Qué hacer?**
-                    - ✅ Usa el modelo pooled (R² = 0.90) como referencia general
+                    - ✅ Usa el modelo pooled (R² = 0.89) como referencia general
                     - ✅ Revisa datos históricos en pestaña "Datos"
                     - ✅ Espera más observaciones para mejorar el ajuste
                     - ⚠️ Toma estas cifras con precaución
@@ -1713,7 +1716,7 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 - El análisis de saturación puede no ser preciso
                 
                 **¿Qué hacer?**
-                - ✅ Usa el modelo pooled (R² = 0.90) como referencia general
+                - ✅ Usa el modelo pooled (R² = 0.89) como referencia general
                 - ✅ Revisa datos históricos en pestaña "Datos"
                 - ✅ Espera más observaciones para mejorar el ajuste
                 - ⚠️ Toma estas cifras con precaución
@@ -2417,7 +2420,7 @@ st.sidebar.info("""
 **📚 Guía Rápida:**
 
 1. **Datos**: Visualiza datos por cliente + ticket USD
-2. **Modelo Pooled**: Ve métricas del modelo (R² = 0.90)
+2. **Modelo Pooled**: Ve métricas del modelo (R² = 0.89)
 3. **Distribuir Presupuesto Fijo**: "Tengo $X aprobado, ¿cómo lo distribuyo?"
 4. **Encontrar Presupuesto Óptimo**: "¿Cuánto DEBERÍA invertir?"
 5. **Dashboard**: Compara todos los clientes
