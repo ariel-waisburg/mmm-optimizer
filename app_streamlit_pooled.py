@@ -450,17 +450,32 @@ def analyze_saturation(cliente, ticket_usd, model, df_hist, curvas_hill=None, ma
     """
     
     # PASO 1: Buscar presupuesto óptimo con optimize_budget_roi
-    # Esto asegura que encontramos el VERDADERO óptimo independientemente de max_budget
+    # RESPETANDO el max_budget como límite absoluto
     optimal_result = optimize_budget_roi(
         cliente, max_budget, ticket_usd, model, df_hist, curvas_hill,
         min_invest_meta=0, min_invest_gads=0, optimize_for='profit'
     )
     
-    # USAR DIRECTAMENTE el presupuesto óptimo encontrado por optimize_budget_roi
-    optimal_budget_real = optimal_result['invest_total_opt']
-    optimal_profit_real = optimal_result['profit_opt']
-    optimal_roi_real = optimal_result['roi_opt']
-    optimal_roas_real = optimal_result['roas_opt']
+    # USAR el presupuesto óptimo encontrado, PERO limitar al max_budget
+    optimal_budget_raw = optimal_result['invest_total_opt']
+    
+    # Si el óptimo excede el límite, recalcular con el límite como tope
+    if optimal_budget_raw > max_budget:
+        # El óptimo real está fuera del rango, usar el máximo disponible
+        limited_result = optimize_distribution_for_fixed_budget(
+            cliente, max_budget, ticket_usd, model, df_hist, curvas_hill,
+            min_invest_meta=0, min_invest_gads=0, optimize_for='profit',
+            force_full_budget=False
+        )
+        optimal_budget_real = limited_result['invest_total']
+        optimal_profit_real = limited_result['profit']
+        optimal_roi_real = limited_result['roi']
+        optimal_roas_real = limited_result['roas']
+    else:
+        optimal_budget_real = optimal_budget_raw
+        optimal_profit_real = optimal_result['profit_opt']
+        optimal_roi_real = optimal_result['roi_opt']
+        optimal_roas_real = optimal_result['roas_opt']
     
     # PASO 2: Generar curva de saturación para visualización
     # Asegurarse que el presupuesto óptimo REAL esté incluido en la curva
@@ -561,6 +576,13 @@ st.sidebar.title("🎯 Navegación")
 page = st.sidebar.radio("Selecciona una página:", 
                         ["📁 Datos", "🤖 Modelo Pooled", "💰 Distribuir Presupuesto Fijo", 
                          "📉 Encontrar Presupuesto Óptimo", "📈 Dashboards"])
+
+# Botón para limpiar caché (útil después de re-entrenar modelo)
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Recargar datos"):
+    st.cache_resource.clear()
+    st.cache_data.clear()
+    st.rerun()
 
 # Cargar datos
 df = load_data()
@@ -729,7 +751,7 @@ elif page == "💰 Distribuir Presupuesto Fijo":
     - Usa las **curvas de respuesta** de cada canal para optimizar la distribución
     - **SIEMPRE gasta el presupuesto completo** (asume que es obligatorio gastarlo)
     - Maximiza profit (revenue incremental - inversión) con ese presupuesto fijo
-    - Te compara vs distribución 50/50 para mostrar la mejora
+    - Te compara vs la **distribución histórica** del cliente para mostrar la mejora real
     
     ⚠️ **Nota:** Si quieres saber **CUÁNTO deberías invertir** (presupuesto flexible), usa la sección "Encontrar Presupuesto Óptimo".
     """)
@@ -752,7 +774,11 @@ elif page == "💰 Distribuir Presupuesto Fijo":
     with col3:
         df_cliente = df[df['empresa'] == selected_client]
         if 'invest_total_paid' in df_cliente.columns:
-            invest_hist = df_cliente['invest_total_paid'].mean()
+            # Solo semanas con inversión > 0 (consistente con Encontrar Presupuesto Óptimo)
+            df_con_inv = df_cliente[df_cliente['invest_total_paid'] > 0]
+            invest_hist = df_con_inv['invest_total_paid'].mean() if len(df_con_inv) > 0 else 0
+            if pd.isna(invest_hist):
+                invest_hist = 0
             st.metric("Invest Histórico/Semana", f"${invest_hist:,.0f}")
     
     # Permitir editar ticket USD
@@ -905,19 +931,46 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                 force_full_budget=True  # FORZAR usar TODO el presupuesto
             )
             
-            # Calcular caso 50/50 para comparación
-            result_5050 = optimize_distribution_for_fixed_budget(
-                selected_client,
-                total_budget,
-                ticket_usd,
-                model,
-                df,
-                curvas_hill,
-                total_budget * 0.5,  # min META = 50%
-                total_budget * 0.5,  # min GADS = 50%
-                optimize_for,
-                force_full_budget=True
-            )
+            # Calcular distribución HISTÓRICA del cliente para comparación
+            df_cliente = df[df['empresa'] == selected_client]
+            
+            # Obtener inversión histórica por canal (solo semanas con inversión > 0)
+            inv_meta_hist = df_cliente[df_cliente['invest_META'] > 0]['invest_META'].mean() if 'invest_META' in df_cliente.columns else 0
+            inv_gads_hist = df_cliente[df_cliente['invest_GADS'] > 0]['invest_GADS'].mean() if 'invest_GADS' in df_cliente.columns else 0
+            
+            # Si no hay datos, usar 50/50
+            if pd.isna(inv_meta_hist) or inv_meta_hist <= 0:
+                inv_meta_hist = 1
+            if pd.isna(inv_gads_hist) or inv_gads_hist <= 0:
+                inv_gads_hist = 1
+            
+            # Calcular proporción histórica
+            total_hist = inv_meta_hist + inv_gads_hist
+            pct_meta_hist = inv_meta_hist / total_hist
+            pct_gads_hist = inv_gads_hist / total_hist
+            
+            # Aplicar proporción histórica al presupuesto dado
+            invest_meta_hist_scaled = total_budget * pct_meta_hist
+            invest_gads_hist_scaled = total_budget * pct_gads_hist
+            
+            # Calcular predicción con distribución histórica
+            trans_dict_hist = estimate_transactions(invest_meta_hist_scaled, invest_gads_hist_scaled, 
+                                                   selected_client, model, df, curvas_hill)
+            
+            result_hist = {
+                'invest_META': invest_meta_hist_scaled,
+                'invest_GADS': invest_gads_hist_scaled,
+                'invest_total': total_budget,
+                'trans': trans_dict_hist['total'],
+                'trans_META': trans_dict_hist['META'],
+                'trans_GADS': trans_dict_hist['GADS'],
+                'revenue': trans_dict_hist['total'] * ticket_usd,
+                'revenue_META': trans_dict_hist['META'] * ticket_usd,
+                'revenue_GADS': trans_dict_hist['GADS'] * ticket_usd,
+                'profit': trans_dict_hist['total'] * ticket_usd - total_budget,
+                'roi': (trans_dict_hist['total'] * ticket_usd - total_budget) / total_budget if total_budget > 0 else 0,
+                'roas': trans_dict_hist['total'] * ticket_usd / total_budget if total_budget > 0 else 0
+            }
             
             # Construir resultado en formato compatible
             result = {
@@ -935,25 +988,29 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                 'roi_opt': result_opt['roi'],
                 'roas_opt': result_opt['roas'],
                 
-                # 50/50
-                'invest_META_actual': result_5050['invest_META'],
-                'invest_GADS_actual': result_5050['invest_GADS'],
-                'trans_actual': result_5050['trans'],
-                'trans_META_actual': result_5050['trans_META'],
-                'trans_GADS_actual': result_5050['trans_GADS'],
-                'revenue_actual': result_5050['revenue'],
-                'revenue_META_actual': result_5050['revenue_META'],
-                'revenue_GADS_actual': result_5050['revenue_GADS'],
-                'profit_actual': result_5050['profit'],
-                'roi_actual': result_5050['roi'],
-                'roas_actual': result_5050['roas'],
+                # Distribución Histórica
+                'invest_META_actual': result_hist['invest_META'],
+                'invest_GADS_actual': result_hist['invest_GADS'],
+                'trans_actual': result_hist['trans'],
+                'trans_META_actual': result_hist['trans_META'],
+                'trans_GADS_actual': result_hist['trans_GADS'],
+                'revenue_actual': result_hist['revenue'],
+                'revenue_META_actual': result_hist['revenue_META'],
+                'revenue_GADS_actual': result_hist['revenue_GADS'],
+                'profit_actual': result_hist['profit'],
+                'roi_actual': result_hist['roi'],
+                'roas_actual': result_hist['roas'],
                 
-                # Deltas
-                'delta_trans': result_opt['trans'] - result_5050['trans'],
-                'delta_revenue': result_opt['revenue'] - result_5050['revenue'],
-                'delta_profit': result_opt['profit'] - result_5050['profit'],
-                'delta_roi': result_opt['roi'] - result_5050['roi'],
-                'delta_roas': result_opt['roas'] - result_5050['roas'],
+                # Distribución porcentual histórica (para mostrar)
+                'pct_meta_hist': pct_meta_hist,
+                'pct_gads_hist': pct_gads_hist,
+                
+                # Deltas (óptimo vs histórico)
+                'delta_trans': result_opt['trans'] - result_hist['trans'],
+                'delta_revenue': result_opt['revenue'] - result_hist['revenue'],
+                'delta_profit': result_opt['profit'] - result_hist['profit'],
+                'delta_roi': result_opt['roi'] - result_hist['roi'],
+                'delta_roas': result_opt['roas'] - result_hist['roas'],
                 
                 # Baseline (solo para referencia)
                 'baseline': 0  # No usado en esta sección
@@ -965,10 +1022,10 @@ elif page == "💰 Distribuir Presupuesto Fijo":
             result['roi_GADS_opt'] = (result_opt['revenue_GADS'] - result_opt['invest_GADS']) / result_opt['invest_GADS'] if result_opt['invest_GADS'] > 0 else 0
             result['roas_GADS_opt'] = result_opt['revenue_GADS'] / result_opt['invest_GADS'] if result_opt['invest_GADS'] > 0 else 0
             
-            result['roi_META_actual'] = (result_5050['revenue_META'] - result_5050['invest_META']) / result_5050['invest_META'] if result_5050['invest_META'] > 0 else 0
-            result['roas_META_actual'] = result_5050['revenue_META'] / result_5050['invest_META'] if result_5050['invest_META'] > 0 else 0
-            result['roi_GADS_actual'] = (result_5050['revenue_GADS'] - result_5050['invest_GADS']) / result_5050['invest_GADS'] if result_5050['invest_GADS'] > 0 else 0
-            result['roas_GADS_actual'] = result_5050['revenue_GADS'] / result_5050['invest_GADS'] if result_5050['invest_GADS'] > 0 else 0
+            result['roi_META_actual'] = (result_hist['revenue_META'] - result_hist['invest_META']) / result_hist['invest_META'] if result_hist['invest_META'] > 0 else 0
+            result['roas_META_actual'] = result_hist['revenue_META'] / result_hist['invest_META'] if result_hist['invest_META'] > 0 else 0
+            result['roi_GADS_actual'] = (result_hist['revenue_GADS'] - result_hist['invest_GADS']) / result_hist['invest_GADS'] if result_hist['invest_GADS'] > 0 else 0
+            result['roas_GADS_actual'] = result_hist['revenue_GADS'] / result_hist['invest_GADS'] if result_hist['invest_GADS'] > 0 else 0
             
             if result:
                 st.success("✅ Optimización completada")
@@ -1111,13 +1168,16 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                 asumiendo que es obligatorio gastarlo completo.
                 """)
                 
-                st.info("""
-                💡 **Importante:** 
+                pct_m = result.get('pct_meta_hist', 0.5) * 100
+                pct_g = result.get('pct_gads_hist', 0.5) * 100
+                st.info(f"""
+                💡 **Importante:**
                 - Las transacciones y revenue mostrados son **INCREMENTALES** (atribuidos a la inversión publicitaria)
-                - Las flechitas 🔼🔽 comparan **DISTRIBUCIÓN ÓPTIMA** vs **50/50** (distribución igual entre canales)
-                - Ambas opciones gastan los ${:,.0f} USD completos, solo cambia la distribución
+                - Las flechitas 🔼🔽 comparan **DISTRIBUCIÓN ÓPTIMA** vs **DISTRIBUCIÓN HISTÓRICA** del cliente
+                - La distribución histórica es: **{pct_m:.0f}% META / {pct_g:.0f}% GADS**
+                - Ambas opciones gastan los ${total_budget:,.0f} USD completos, solo cambia la distribución
                 - Un delta negativo en transacciones puede ser normal si la distribución óptima prioriza profit sobre volumen
-                """.format(total_budget))
+                """)
                 
                 # Primera fila: Distribución del presupuesto
                 st.markdown("### 💰 Distribución Óptima del Presupuesto")
@@ -1148,22 +1208,22 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                     st.metric(
                         "Revenue Incremental (USD)",
                         f"${result['revenue_opt']:,.0f}",
-                        f"${result['delta_revenue']:+,.0f} vs 50/50",
-                        help="Revenue generado SOLO por la inversión publicitaria (sin baseline). Delta = diferencia vs distribución 50/50"
+                        f"${result['delta_revenue']:+,.0f} vs histórico",
+                        help="Revenue generado SOLO por la inversión publicitaria (sin baseline). Delta = diferencia vs distribución histórica del cliente"
                     )
                 with col2:
                     st.metric(
                         "ROI",
                         f"{result['roi_opt']*100:.1f}%",
-                        f"{result['delta_roi']*100:+.1f}pp vs 50/50",
-                        help="ROI calculado sobre transacciones incrementales. Delta = diferencia vs distribución 50/50"
+                        f"{result['delta_roi']*100:+.1f}pp vs histórico",
+                        help="ROI calculado sobre transacciones incrementales. Delta = diferencia vs distribución histórica del cliente"
                     )
                 with col3:
                     st.metric(
                         "ROAS",
                         f"{result['roas_opt']:.2f}x",
-                        f"{result['delta_roas']:+.2f}x vs 50/50",
-                        help="ROAS calculado sobre transacciones incrementales. Delta = diferencia vs distribución 50/50"
+                        f"{result['delta_roas']:+.2f}x vs histórico",
+                        help="ROAS calculado sobre transacciones incrementales. Delta = diferencia vs distribución histórica del cliente"
                     )
                 
                 # Segunda fila de métricas
@@ -1172,15 +1232,15 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                     st.metric(
                         "Trans Incrementales",
                         f"{result['trans_opt']:.0f}",
-                        f"{result['delta_trans']:+.0f} vs 50/50",
-                        help="Transacciones atribuidas a la inversión (sin baseline). Delta = diferencia vs distribución 50/50. Puede ser negativo si el óptimo prioriza profit sobre volumen."
+                        f"{result['delta_trans']:+.0f} vs histórico",
+                        help="Transacciones atribuidas a la inversión (sin baseline). Delta = diferencia vs distribución histórica. Puede ser negativo si el óptimo prioriza profit sobre volumen."
                     )
                 with col2:
                     st.metric(
                         "Profit (USD)",
                         f"${result['profit_opt']:,.0f}",
-                        f"${result['delta_profit']:+,.0f} vs 50/50",
-                        help="Revenue incremental - Inversión. Delta = diferencia vs distribución 50/50"
+                        f"${result['delta_profit']:+,.0f} vs histórico",
+                        help="Revenue incremental - Inversión. Delta = diferencia vs distribución histórica del cliente"
                     )
                 with col3:
                     cpa_opt = result['invest_total_opt'] / result['trans_opt'] if result['trans_opt'] > 0 else 0
@@ -1202,19 +1262,19 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                     ℹ️ **¿Por qué Trans Incrementales tiene delta negativo ({result['delta_trans']:.0f})?**
                     
                     - **Óptimo:** {result['trans_opt']:.0f} trans → ${result['profit_opt']:,.0f} profit
-                    - **50/50:** {result['trans_actual']:.0f} trans → ${result['profit_actual']:,.0f} profit
-                    
-                    El optimizer **prioriza profit sobre volumen**. La distribución 50/50 genera {abs(result['delta_trans']):.0f} transacciones más, 
-                    pero con ${abs(result['delta_profit']):,.0f} MENOS profit. El óptimo sacrifica {abs(result['delta_trans']):.0f} transacciones 
+                    - **Histórico:** {result['trans_actual']:.0f} trans → ${result['profit_actual']:,.0f} profit
+
+                    El optimizer **prioriza profit sobre volumen**. La distribución histórica genera {abs(result['delta_trans']):.0f} transacciones más,
+                    pero con ${abs(result['delta_profit']):,.0f} MENOS profit. El óptimo sacrifica {abs(result['delta_trans']):.0f} transacciones
                     para maximizar la rentabilidad.
                     """)
                 
                 # ============================================================
-                # COMPARACIÓN ÓPTIMO VS 50/50
+                # COMPARACIÓN ÓPTIMO VS HISTÓRICO
                 # ============================================================
-                
+
                 st.markdown("---")
-                st.subheader("⚖️ Comparación: Óptimo vs 50/50")
+                st.subheader(f"⚖️ Comparación: Óptimo vs Histórico ({result.get('pct_meta_hist', 0.5)*100:.0f}% META / {result.get('pct_gads_hist', 0.5)*100:.0f}% GADS)")
                 
                 col1, col2 = st.columns(2)
                 
@@ -1231,10 +1291,10 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                     """)
                 
                 with col2:
-                    st.markdown("### 📊 Distribución 50/50")
+                    st.markdown(f"### 📊 Distribución Histórica ({result.get('pct_meta_hist', 0.5)*100:.0f}/{result.get('pct_gads_hist', 0.5)*100:.0f})")
                     st.markdown(f"""
-                    - **META:** ${result['invest_META_actual']:,.0f} (50%)
-                    - **GADS:** ${result['invest_GADS_actual']:,.0f} (50%)
+                    - **META:** ${result['invest_META_actual']:,.0f} ({result.get('pct_meta_hist', 0.5)*100:.0f}%)
+                    - **GADS:** ${result['invest_GADS_actual']:,.0f} ({result.get('pct_gads_hist', 0.5)*100:.0f}%)
                     - **Transacciones:** {result['trans_actual']:.0f}
                     - **Revenue:** ${result['revenue_actual']:,.0f}
                     - **Profit:** ${result['profit_actual']:,.0f}
@@ -1255,7 +1315,7 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                         f"{result['roi_opt']*100:.1f}%",
                         f"{result['roas_opt']:.2f}x"
                     ],
-                    '50/50': [
+                    'Histórico': [
                         f"${result['invest_META_actual']:,.0f}",
                         f"${result['invest_GADS_actual']:,.0f}",
                         f"{result['trans_actual']:.0f}",
@@ -1426,12 +1486,12 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                 
                 with col1:
                     fig1 = go.Figure()
-                    fig1.add_trace(go.Bar(name='META', 
-                                         x=['Actual (50/50)', 'Óptimo'], 
+                    fig1.add_trace(go.Bar(name='META',
+                                         x=['Histórico', 'Óptimo'],
                                          y=[result['invest_META_actual'], result['invest_META_opt']],
                                          marker_color='#3498db'))
-                    fig1.add_trace(go.Bar(name='GADS', 
-                                         x=['Actual (50/50)', 'Óptimo'], 
+                    fig1.add_trace(go.Bar(name='GADS',
+                                         x=['Histórico', 'Óptimo'],
                                          y=[result['invest_GADS_actual'], result['invest_GADS_opt']],
                                          marker_color='#e74c3c'))
                     fig1.update_layout(title='Distribución de Inversión (USD)',
@@ -1501,7 +1561,7 @@ elif page == "💰 Distribuir Presupuesto Fijo":
                 - **Revenue incremental:** ${result['revenue_opt']:,.0f} USD (calculado: {result['trans_opt']:.0f} trans × ${ticket_usd:.2f} ticket)
                 - **Profit:** <span style="color:{profit_color}">**${result['profit_opt']:,.0f} USD**</span>
                 - **ROI:** {result['roi_opt']*100:.1f}% | **ROAS:** {result['roas_opt']:.2f}x
-                - **Mejora vs 50/50:** +${result['delta_profit']:,.0f} profit ({result['delta_roi']*100:+.1f}pp ROI)
+                - **Mejora vs histórico:** +${result['delta_profit']:,.0f} profit ({result['delta_roi']*100:+.1f}pp ROI)
                 
                 **Contexto:**
                 - Baseline orgánico: {result['baseline']:.0f} trans/semana (sin inversión)
@@ -1562,26 +1622,54 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
     # Obtener ticket USD
     ticket_default = get_ticket_usd(df, selected_client)
     
-    col1, col2 = st.columns(2)
-    with col1:
-        ticket_usd = st.number_input(
-            "Ticket Promedio (USD)",
-            min_value=1.0,
-            value=float(ticket_default),
-            step=1.0,
-            key=f"sat_ticket_{selected_client}"
-        )
-    with col2:
-        max_budget_analysis = st.number_input(
-            "Presupuesto máximo a analizar (USD)",
-            min_value=1000.0,
-            value=20000.0,
-            step=1000.0,
-            key='sat_max_budget'
-        )
+    ticket_usd = st.number_input(
+        "Ticket Promedio (USD)",
+        min_value=1.0,
+        value=float(ticket_default),
+        step=1.0,
+        key=f"sat_ticket_{selected_client}"
+    )
+    
+    # Calcular inversión histórica del cliente (SOLO semanas con inversión > 0, consistente con entrenamiento de curvas)
+    df_cliente_sat = df[df['empresa'] == selected_client]
+    
+    # Filtrar semanas con inversión > 0 (como hace el entrenamiento de curvas Hill)
+    if 'invest_total_paid' in df_cliente_sat.columns:
+        df_con_inv = df_cliente_sat[df_cliente_sat['invest_total_paid'] > 0]
+        invest_hist_cliente = df_con_inv['invest_total_paid'].mean() if len(df_con_inv) > 0 else 500
+    else:
+        invest_hist_cliente = 500
+    
+    if pd.isna(invest_hist_cliente) or invest_hist_cliente <= 0:
+        invest_hist_cliente = 500
+    
+    # Contar semanas con/sin inversión para info
+    n_semanas_total = len(df_cliente_sat)
+    n_semanas_con_inv = len(df_cliente_sat[df_cliente_sat['invest_total_paid'] > 0]) if 'invest_total_paid' in df_cliente_sat.columns else 0
+    
+    # Campo de presupuesto máximo con placeholder basado en histórico
+    st.subheader("2️⃣ Define Presupuesto Máximo")
+    
+    st.info(f"""
+    💡 **Inversión histórica del cliente:** ${invest_hist_cliente:,.0f}/semana (promedio de {n_semanas_con_inv}/{n_semanas_total} semanas con inversión)
+    
+    Puedes modificar este valor según la capacidad real del cliente. El modelo buscará el **presupuesto óptimo**
+    dentro de este límite. Si el óptimo teórico es mayor, te mostrará el mejor resultado posible.
+    """)
+    
+    max_budget_analysis = st.number_input(
+        "Presupuesto Máximo (USD/semana)",
+        min_value=10.0,
+        value=float(invest_hist_cliente),  # Default: inversión histórica
+        step=50.0,
+        key=f"sat_max_budget_{selected_client}",
+        help="Define el límite máximo de inversión. El modelo buscará el óptimo dentro de este límite."
+    )
     
     # Ejecutar análisis (150 puntos = buena precisión)
-    if st.button("🔍 Analizar Saturación", type="primary"):
+    st.subheader("3️⃣ Analizar")
+    
+    if st.button("🔍 Encontrar Presupuesto Óptimo", type="primary"):
         with st.spinner("Analizando curva de saturación..."):
             sat_analysis = analyze_saturation(
                 selected_client,
@@ -1637,12 +1725,26 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
             
             st.subheader("🎯 Presupuesto Óptimo Recomendado")
             
-            st.info("""
-            💡 **¿Qué es el Presupuesto Óptimo?**
+            # Verificar si el óptimo está limitado por el presupuesto máximo
+            opt_budget = sat_analysis['optimal_budget']
+            is_limited = opt_budget >= max_budget_analysis * 0.95  # Si está al 95%+ del máximo, está limitado
             
-            Es el presupuesto semanal que **maximiza tu profit** (revenue - inversión). 
-            Invertir menos genera menos ganancia. Invertir más también genera menos ganancia.
-            """)
+            if is_limited:
+                st.warning(f"""
+                ⚠️ **El óptimo está LIMITADO por tu presupuesto máximo (${max_budget_analysis:,.0f})**
+                
+                El modelo sugiere que podrías obtener más profit invirtiendo más de ${max_budget_analysis:,.0f}/semana,
+                pero has definido ese límite. El resultado mostrado es el **mejor posible dentro de tu restricción**.
+                
+                💡 Si el cliente tiene capacidad para invertir más, considera aumentar el presupuesto máximo.
+                """)
+            else:
+                st.info("""
+                💡 **¿Qué es el Presupuesto Óptimo?**
+                
+                Es el presupuesto semanal que **maximiza tu profit** (revenue - inversión).
+                Invertir menos genera menos ganancia. Invertir más también genera menos ganancia (rendimientos decrecientes).
+                """)
             
             # Obtener la distribución META/GADS del presupuesto óptimo
             optimal_distribution = optimize_distribution_for_fixed_budget(
@@ -1659,36 +1761,39 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
             )
             
             # Métricas principales en dos filas
-            st.markdown("#### 💰 Presupuesto y Distribución")
+            label_suffix = " (limitado)" if is_limited else ""
+            st.markdown(f"#### 💰 Presupuesto y Distribución{' ⚠️' if is_limited else ''}")
             col1, col2, col3 = st.columns(3)
             
             with col1:
                 st.metric(
-                    "Presupuesto Óptimo",
+                    "Mejor Presupuesto" if is_limited else "Presupuesto Óptimo",
                     f"${sat_analysis['optimal_budget']:,.0f}",
-                    "USD/semana"
+                    "⚠️ limitado" if is_limited else "USD/semana"
                 )
             with col2:
+                meta_pct = (optimal_distribution['invest_META']/sat_analysis['optimal_budget']*100) if sat_analysis['optimal_budget'] > 0 else 0
                 st.metric(
-                    "META Óptimo",
+                    "META",
                     f"${optimal_distribution['invest_META']:,.0f}",
-                    f"{optimal_distribution['invest_META']/sat_analysis['optimal_budget']*100:.0f}% del óptimo"
+                    f"{meta_pct:.0f}% del total"
                 )
             with col3:
+                gads_pct = (optimal_distribution['invest_GADS']/sat_analysis['optimal_budget']*100) if sat_analysis['optimal_budget'] > 0 else 0
                 st.metric(
-                    "GADS Óptimo",
+                    "GADS",
                     f"${optimal_distribution['invest_GADS']:,.0f}",
-                    f"{optimal_distribution['invest_GADS']/sat_analysis['optimal_budget']*100:.0f}% del óptimo"
+                    f"{gads_pct:.0f}% del total"
                 )
             
-            st.markdown("#### 📈 Resultados Esperados")
+            st.markdown(f"#### 📈 Resultados Esperados{' (dentro del límite)' if is_limited else ''}")
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
                 st.metric(
-                    "Profit Máximo",
+                    "Mejor Profit" if is_limited else "Profit Máximo",
                     f"${sat_analysis['optimal_profit']:,.0f}",
-                    "USD/semana"
+                    "⚠️ limitado" if is_limited else "USD/semana"
                 )
             with col2:
                 st.metric(
@@ -1707,12 +1812,21 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                     f"{sat_analysis['optimal_roas']:.2f}x"
                 )
             
+            # Calcular porcentajes de forma segura
+            opt_budget = sat_analysis['optimal_budget']
+            if opt_budget > 0:
+                meta_dist_pct = optimal_distribution['invest_META']/opt_budget*100
+                gads_dist_pct = optimal_distribution['invest_GADS']/opt_budget*100
+            else:
+                meta_dist_pct = 0
+                gads_dist_pct = 0
+            
             st.success(f"""
-            ✅ **Recomendación:** Invertir **${sat_analysis['optimal_budget']:,.0f} USD/semana** en medios pagos.
+            ✅ **Recomendación:** Invertir **${opt_budget:,.0f} USD/semana** en medios pagos.
             
             **Distribución óptima (basada en curvas de respuesta):**
-            - **META:** ${optimal_distribution['invest_META']:,.0f} ({optimal_distribution['invest_META']/sat_analysis['optimal_budget']*100:.0f}%) → {optimal_distribution['trans_META']:.0f} transacciones
-            - **GADS:** ${optimal_distribution['invest_GADS']:,.0f} ({optimal_distribution['invest_GADS']/sat_analysis['optimal_budget']*100:.0f}%) → {optimal_distribution['trans_GADS']:.0f} transacciones
+            - **META:** ${optimal_distribution['invest_META']:,.0f} ({meta_dist_pct:.0f}%) → {optimal_distribution['trans_META']:.0f} transacciones
+            - **GADS:** ${optimal_distribution['invest_GADS']:,.0f} ({gads_dist_pct:.0f}%) → {optimal_distribution['trans_GADS']:.0f} transacciones
             
             **Resultados esperados (incrementales):**
             - {optimal_distribution['trans']:.0f} transacciones/semana atribuidas a la inversión
@@ -1721,13 +1835,187 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
             - ROAS de {sat_analysis['optimal_roas']:.2f}x (cada $1 invertido genera ${sat_analysis['optimal_roas']:.2f} de revenue)
             """)
             
+            # ============================================================
+            # COMPARACIÓN VS HISTÓRICO
+            # ============================================================
+            
+            st.markdown("---")
+            st.subheader("⚖️ Comparación vs Inversión Histórica")
+            
+            # Calcular métricas históricas (consistente con placeholder)
+            # Usar invest_total_paid = cuánto realmente invirtieron por semana
+            total_hist_sat = invest_hist_cliente  # Mismo valor que placeholder
+            
+            # Calcular proporción histórica para distribuir
+            df_con_inv_sat = df_cliente_sat[df_cliente_sat['invest_total_paid'] > 0] if 'invest_total_paid' in df_cliente_sat.columns else df_cliente_sat
+            
+            # Suma total de cada canal (no promedio por separado, para evitar inflar)
+            sum_meta = df_con_inv_sat['invest_META'].sum() if 'invest_META' in df_con_inv_sat.columns else 0
+            sum_gads = df_con_inv_sat['invest_GADS'].sum() if 'invest_GADS' in df_con_inv_sat.columns else 0
+            
+            if pd.isna(sum_meta) or sum_meta < 0:
+                sum_meta = 0
+            if pd.isna(sum_gads) or sum_gads < 0:
+                sum_gads = 0
+            
+            total_sum = sum_meta + sum_gads
+            if total_sum > 0:
+                pct_meta_hist = sum_meta / total_sum
+                pct_gads_hist = sum_gads / total_sum
+            else:
+                pct_meta_hist = 0.5
+                pct_gads_hist = 0.5
+            
+            # Distribuir total histórico según proporción real
+            inv_meta_hist_sat = total_hist_sat * pct_meta_hist
+            inv_gads_hist_sat = total_hist_sat * pct_gads_hist
+
+            if total_hist_sat > 0:
+                # Calcular predicción con distribución histórica
+                trans_hist_pred = estimate_transactions(inv_meta_hist_sat, inv_gads_hist_sat,
+                                                       selected_client, model, df, curvas_hill)
+                revenue_hist_pred = trans_hist_pred['total'] * ticket_usd
+                profit_hist_pred = revenue_hist_pred - total_hist_sat
+                
+                # Calcular mejora
+                delta_invest = opt_budget - total_hist_sat
+                delta_trans = optimal_distribution['trans'] - trans_hist_pred['total']
+                delta_revenue = optimal_distribution['revenue'] - revenue_hist_pred
+                delta_profit = sat_analysis['optimal_profit'] - profit_hist_pred
+                
+                pct_mejora_profit = (delta_profit / abs(profit_hist_pred) * 100) if profit_hist_pred != 0 else 0
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**📊 Histórico (predicción)**")
+                    st.markdown(f"""
+                    - Inversión: **${total_hist_sat:,.0f}**
+                    - META: ${inv_meta_hist_sat:,.0f}
+                    - GADS: ${inv_gads_hist_sat:,.0f}
+                    - Trans: {trans_hist_pred['total']:.0f}
+                    - Profit: ${profit_hist_pred:,.0f}
+                    """)
+                
+                with col2:
+                    st.markdown("**🎯 Óptimo**")
+                    st.markdown(f"""
+                    - Inversión: **${opt_budget:,.0f}**
+                    - META: ${optimal_distribution['invest_META']:,.0f}
+                    - GADS: ${optimal_distribution['invest_GADS']:,.0f}
+                    - Trans: {optimal_distribution['trans']:.0f}
+                    - Profit: ${sat_analysis['optimal_profit']:,.0f}
+                    """)
+                
+                with col3:
+                    st.markdown("**📈 Mejora**")
+                    st.markdown(f"""
+                    - Inversión: **{'+' if delta_invest >= 0 else ''}{delta_invest:,.0f}**
+                    - Trans: {'+' if delta_trans >= 0 else ''}{delta_trans:.0f}
+                    - Revenue: {'+' if delta_revenue >= 0 else ''}{delta_revenue:,.0f}
+                    - Profit: **{'+' if delta_profit >= 0 else ''}{delta_profit:,.0f}**
+                    - Mejora: **{'+' if pct_mejora_profit >= 0 else ''}{pct_mejora_profit:.1f}%**
+                    """)
+                
+                if delta_profit > 0:
+                    st.success(f"✅ Siguiendo la recomendación, podrías ganar **${delta_profit:,.0f} más de profit** por semana (+{pct_mejora_profit:.0f}%)")
+                elif delta_profit < 0:
+                    st.warning(f"⚠️ El óptimo genera menos profit que el histórico. Esto puede indicar que ya estás cerca del óptimo o que el modelo necesita más datos.")
+            else:
+                st.warning("⚠️ No hay suficientes datos históricos de inversión para comparar.")
+            
+            # ============================================================
+            # INSIGHTS: Explicar situaciones especiales
+            # ============================================================
+            
+            # Caso 1: Presupuesto óptimo = $0 o muy bajo
+            if opt_budget < 100:
+                with st.expander("🔍 ¿Por qué el presupuesto óptimo es $0 o muy bajo?", expanded=True):
+                    # Obtener datos del cliente para insights
+                    df_cliente = df[df['empresa'] == selected_client]
+                    atrib_cliente = model['atribucion'][model['atribucion']['empresa'] == selected_client]
+                    
+                    baseline = atrib_cliente['y_base'].mean() if len(atrib_cliente) > 0 else 0
+                    meta_incr = atrib_cliente['META_incr'].mean() if len(atrib_cliente) > 0 else 0
+                    gads_incr = atrib_cliente['GADS_incr'].mean() if len(atrib_cliente) > 0 else 0
+                    total_incr = meta_incr + gads_incr
+                    
+                    # Solo semanas con inversión > 0 (consistente con el resto del app)
+                    if 'invest_total_paid' in df_cliente.columns:
+                        df_con_inv_diag = df_cliente[df_cliente['invest_total_paid'] > 0]
+                        invest_hist = df_con_inv_diag['invest_total_paid'].mean() if len(df_con_inv_diag) > 0 else 0
+                        if pd.isna(invest_hist):
+                            invest_hist = 0
+                    else:
+                        invest_hist = 0
+                    trans_avg = df_cliente['transactions_GA'].mean() if 'transactions_GA' in df_cliente.columns else 0
+                    
+                    revenue_incr_calc = total_incr * ticket_usd
+                    profit_calc = revenue_incr_calc - invest_hist if invest_hist > 0 else 0
+                    roi_calc = (profit_calc / invest_hist * 100) if invest_hist > 0 else 0
+                    roas_calc = (revenue_incr_calc / invest_hist) if invest_hist > 0 else 0
+                    
+                    st.markdown(f"""
+                    **📊 Diagnóstico para {selected_client}:**
+                    
+                    | Métrica | Valor | Interpretación |
+                    |---------|-------|----------------|
+                    | Baseline (orgánico) | **{baseline:.0f}** trans/semana | Ventas SIN publicidad |
+                    | Incremental (pagado) | **{total_incr:.1f}** trans/semana | Ventas POR publicidad |
+                    | Inversión histórica | **${invest_hist:,.0f}**/semana | Lo que inviertes en promedio |
+                    | Ticket promedio | **${ticket_usd:.2f}** | Revenue por transacción |
+                    | Revenue incremental | **${revenue_incr_calc:,.0f}** | Ventas atribuidas a ads |
+                    | Profit estimado | **${profit_calc:,.0f}** | Revenue - Inversión |
+                    | ROI histórico | **{roi_calc:.1f}%** | {"❌ Negativo" if roi_calc < 0 else "✅ Positivo"} |
+                    | ROAS histórico | **{roas_calc:.2f}x** | {"❌ < 1 (pérdida)" if roas_calc < 1 else "✅ > 1 (ganancia)"} |
+                    """)
+                    
+                    # Diagnóstico específico
+                    problemas = []
+                    if roas_calc < 1:
+                        problemas.append("**ROAS < 1**: Cada $1 invertido genera menos de $1 de revenue → pérdida neta")
+                    if baseline > trans_avg * 0.9:
+                        problemas.append("**Baseline muy alto**: El modelo atribuye casi todas las ventas a tráfico orgánico")
+                    
+                    curva = curvas_hill.get(selected_client, {}) if curvas_hill else {}
+                    if not curva.get('META'):
+                        problemas.append("**Sin curva META**: No hay datos suficientes para modelar respuesta de META")
+                    if not curva.get('GADS'):
+                        problemas.append("**Sin curva GADS**: No hay datos suficientes para modelar respuesta de GADS")
+                    
+                    if problemas:
+                        st.error("**❌ Problemas detectados:**")
+                        for p in problemas:
+                            st.markdown(f"- {p}")
+                        
+                        st.info("""
+                        **¿Qué hacer?**
+                        1. ✅ Revisar datos históricos en pestaña "Datos"
+                        2. ✅ Verificar si hubo períodos SIN inversión (para calibrar baseline)
+                        3. ✅ Considerar prueba A/B: pausar inversión 2-3 semanas para medir baseline real
+                        4. ⚠️ El modelo puede necesitar más datos para este cliente
+                        """)
+            
+            # Caso 2: ROAS < 1 pero profit positivo (situación rara pero posible)
+            elif sat_analysis['optimal_roas'] < 1 and sat_analysis['optimal_profit'] > 0:
+                st.warning("""
+                ⚠️ **Atención**: ROAS < 1 indica que no recuperas la inversión directamente. 
+                El profit positivo puede deberse a efectos de escala. Revisa las curvas de respuesta.
+                """)
+            
             # Gráfico 1: Profit vs Presupuesto
             st.subheader("📈 Curva de Profit vs Presupuesto")
             
-            st.markdown("""
-            Este gráfico muestra cómo varía el **profit** según el presupuesto invertido.
-            El punto óptimo (⭐) indica dónde maximizas tus ganancias.
-            """)
+            if is_limited:
+                st.markdown(f"""
+                Este gráfico muestra cómo varía el **profit** según el presupuesto invertido.
+                ⚠️ El punto marcado es el **mejor dentro de tu límite** (${max_budget_analysis:,.0f}), no necesariamente el óptimo absoluto.
+                """)
+            else:
+                st.markdown("""
+                Este gráfico muestra cómo varía el **profit** según el presupuesto invertido.
+                El punto óptimo (⭐) indica dónde maximizas tus ganancias.
+                """)
             
             fig1 = go.Figure()
             
@@ -1740,19 +2028,33 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 hovertemplate='Presupuesto: $%{x:,.0f}<br>Profit: $%{y:,.0f}<extra></extra>'
             ))
             
-            # Marcar punto ÓPTIMO (máximo profit)
-            fig1.add_trace(go.Scatter(
-                x=[sat_analysis['optimal_budget']],
-                y=[sat_analysis['optimal_profit']],
-                mode='markers+text',
-                name='Presupuesto Óptimo',
-                marker=dict(size=20, color='gold', symbol='star', 
-                           line=dict(color='darkgreen', width=2)),
-                text=[f"ÓPTIMO<br>${sat_analysis['optimal_budget']:,.0f}"],
-                textposition='top center',
-                textfont=dict(size=12, color='darkgreen', family='Arial Black'),
-                hovertemplate='<b>PRESUPUESTO ÓPTIMO</b><br>Presupuesto: $%{x:,.0f}<br>Profit: $%{y:,.0f}<extra></extra>'
-            ))
+            # Marcar punto ÓPTIMO (o mejor dentro del límite)
+            if is_limited:
+                fig1.add_trace(go.Scatter(
+                    x=[sat_analysis['optimal_budget']],
+                    y=[sat_analysis['optimal_profit']],
+                    mode='markers+text',
+                    name='Mejor (limitado)',
+                    marker=dict(size=20, color='orange', symbol='triangle-up', 
+                               line=dict(color='darkorange', width=2)),
+                    text=[f"MEJOR (limitado)<br>${sat_analysis['optimal_budget']:,.0f}"],
+                    textposition='top center',
+                    textfont=dict(size=12, color='darkorange', family='Arial Black'),
+                    hovertemplate='<b>MEJOR DENTRO DEL LÍMITE</b><br>Presupuesto: $%{x:,.0f}<br>Profit: $%{y:,.0f}<extra></extra>'
+                ))
+            else:
+                fig1.add_trace(go.Scatter(
+                    x=[sat_analysis['optimal_budget']],
+                    y=[sat_analysis['optimal_profit']],
+                    mode='markers+text',
+                    name='Presupuesto Óptimo',
+                    marker=dict(size=20, color='gold', symbol='star', 
+                               line=dict(color='darkgreen', width=2)),
+                    text=[f"ÓPTIMO<br>${sat_analysis['optimal_budget']:,.0f}"],
+                    textposition='top center',
+                    textfont=dict(size=12, color='darkgreen', family='Arial Black'),
+                    hovertemplate='<b>PRESUPUESTO ÓPTIMO</b><br>Presupuesto: $%{x:,.0f}<br>Profit: $%{y:,.0f}<extra></extra>'
+                ))
             
             # Línea en profit = 0 (break-even)
             fig1.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1,
@@ -1783,12 +2085,21 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
             
             st.plotly_chart(fig1, use_container_width=True)
             
-            st.info(f"""
-            📊 **Interpretación del gráfico:**
-            - **Antes de ${sat_analysis['optimal_budget']:,.0f}:** El profit crece → Conviene invertir más
-            - **En ${sat_analysis['optimal_budget']:,.0f} (⭐):** Profit máximo → **Punto ideal**
-            - **Después de ${sat_analysis['optimal_budget']:,.0f}:** El profit baja → Estás desperdiciando presupuesto
-            """)
+            # Interpretación del gráfico según si está limitado
+            if is_limited:
+                st.info(f"""
+                📊 **Interpretación del gráfico (⚠️ LIMITADO):**
+                - **Antes de ${sat_analysis['optimal_budget']:,.0f}:** El profit crece → Conviene invertir más
+                - **En ${sat_analysis['optimal_budget']:,.0f}:** Mejor resultado **dentro de tu límite** (${max_budget_analysis:,.0f})
+                - 💡 **El óptimo real podría estar más arriba** - el profit puede seguir creciendo si aumentas el presupuesto máximo
+                """)
+            else:
+                st.info(f"""
+                📊 **Interpretación del gráfico:**
+                - **Antes de ${sat_analysis['optimal_budget']:,.0f}:** El profit crece → Conviene invertir más
+                - **En ${sat_analysis['optimal_budget']:,.0f} (⭐):** Profit máximo → **Punto ideal**
+                - **Después de ${sat_analysis['optimal_budget']:,.0f}:** El profit baja → Estás desperdiciando presupuesto
+                """)
             
             # Gráfico 2: ROI y ROAS vs Presupuesto
             st.subheader("📊 ROI y ROAS vs Presupuesto")
@@ -1819,12 +2130,19 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 hovertemplate='Presupuesto: $%{x:,.0f}<br>ROAS: %{y:.2f}x<extra></extra>'
             ))
             
-            # Marcar punto ÓPTIMO
-            fig2.add_vline(x=sat_analysis['optimal_budget'], 
-                          line_dash="dash", line_color="darkgreen", line_width=3,
-                          annotation_text=f"⭐ Óptimo: ${sat_analysis['optimal_budget']:,.0f}",
-                          annotation_position="top",
-                          annotation_font=dict(size=12, color='darkgreen'))
+            # Marcar punto ÓPTIMO (o limitado)
+            if is_limited:
+                fig2.add_vline(x=sat_analysis['optimal_budget'], 
+                              line_dash="dash", line_color="orange", line_width=3,
+                              annotation_text=f"⚠️ Mejor (limitado): ${sat_analysis['optimal_budget']:,.0f}",
+                              annotation_position="top",
+                              annotation_font=dict(size=12, color='orange'))
+            else:
+                fig2.add_vline(x=sat_analysis['optimal_budget'], 
+                              line_dash="dash", line_color="darkgreen", line_width=3,
+                              annotation_text=f"⭐ Óptimo: ${sat_analysis['optimal_budget']:,.0f}",
+                              annotation_position="top",
+                              annotation_font=dict(size=12, color='darkgreen'))
             
             fig2.update_layout(
                 title=f"ROI y ROAS vs Presupuesto - {selected_client}",
@@ -1852,12 +2170,20 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 Este es un análisis más técnico. Si no estás familiarizado con derivadas, puedes ignorarlo.
                 """)
                 
-                st.info("""
-                💡 **Interpretación:**
-                - ROI marginal > 0: Cada $1 adicional aún genera profit ✅
-                - ROI marginal = 0: Has alcanzado el máximo profit (punto óptimo) ⭐
-                - ROI marginal < 0: Cada $1 adicional reduce tu profit ❌
-                """)
+                if is_limited:
+                    st.info("""
+                    💡 **Interpretación (⚠️ LIMITADO por presupuesto máximo):**
+                    - ROI marginal > 0: Cada $1 adicional aún genera profit ✅
+                    - El punto marcado es el **mejor dentro de tu límite**, no necesariamente el óptimo absoluto
+                    - 💡 Si el ROI marginal sigue siendo positivo al final, podrías ganar más aumentando el presupuesto máximo
+                    """)
+                else:
+                    st.info("""
+                    💡 **Interpretación:**
+                    - ROI marginal > 0: Cada $1 adicional aún genera profit ✅
+                    - ROI marginal = 0: Has alcanzado el máximo profit (punto óptimo) ⭐
+                    - ROI marginal < 0: Cada $1 adicional reduce tu profit ❌
+                    """)
                 
                 fig3 = go.Figure()
                 
@@ -1876,12 +2202,19 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 fig3.add_hline(y=0, line_dash="solid", line_color="red", line_width=1,
                               annotation_text="ROI Marginal = 0", annotation_position="right")
                 
-                # Marcar punto ÓPTIMO
-                fig3.add_vline(x=sat_analysis['optimal_budget'], 
-                              line_dash="dash", line_color="darkgreen", line_width=3,
-                              annotation_text=f"⭐ Óptimo: ${sat_analysis['optimal_budget']:,.0f}",
-                              annotation_position="top",
-                              annotation_font=dict(size=12, color='darkgreen'))
+                # Marcar punto ÓPTIMO (o limitado)
+                if is_limited:
+                    fig3.add_vline(x=sat_analysis['optimal_budget'], 
+                                  line_dash="dash", line_color="orange", line_width=3,
+                                  annotation_text=f"⚠️ Mejor (limitado): ${sat_analysis['optimal_budget']:,.0f}",
+                                  annotation_position="top",
+                                  annotation_font=dict(size=12, color='orange'))
+                else:
+                    fig3.add_vline(x=sat_analysis['optimal_budget'], 
+                                  line_dash="dash", line_color="darkgreen", line_width=3,
+                                  annotation_text=f"⭐ Óptimo: ${sat_analysis['optimal_budget']:,.0f}",
+                                  annotation_position="top",
+                                  annotation_font=dict(size=12, color='darkgreen'))
                 
                 fig3.update_layout(
                     title=f"ROI Marginal vs Presupuesto - {selected_client}",
@@ -1894,12 +2227,20 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 
                 st.plotly_chart(fig3, use_container_width=True)
                 
-                st.markdown(f"""
-                📊 **Observa en el gráfico:**
-                - El ROI marginal es **positivo** antes de ${sat_analysis['optimal_budget']:,.0f} (zona verde)
-                - Se cruza con **0** aproximadamente en ${sat_analysis['optimal_budget']:,.0f} (punto óptimo)
-                - Se vuelve **negativo** después (zona roja = desperdicio)
-                """)
+                if is_limited:
+                    st.markdown(f"""
+                    📊 **Observa en el gráfico (⚠️ LIMITADO):**
+                    - El ROI marginal es **positivo** antes de ${sat_analysis['optimal_budget']:,.0f}
+                    - El punto marcado (${sat_analysis['optimal_budget']:,.0f}) es el **mejor dentro de tu límite**
+                    - 💡 Si el ROI marginal sigue siendo positivo al final, el óptimo real está más arriba
+                    """)
+                else:
+                    st.markdown(f"""
+                    📊 **Observa en el gráfico:**
+                    - El ROI marginal es **positivo** antes de ${sat_analysis['optimal_budget']:,.0f} (zona verde)
+                    - Se cruza con **0** aproximadamente en ${sat_analysis['optimal_budget']:,.0f} (punto óptimo)
+                    - Se vuelve **negativo** después (zona roja = desperdicio)
+                    """)
             
             # Recomendaciones Finales
             st.markdown("---")
@@ -1916,6 +2257,7 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
             optimal_roas_val = sat_analysis['optimal_roas']
             
             # Rangos de presupuesto
+            conservador = optimal_budget_val * 1.2  # Definir antes para usar en guías
             col1, col2, col3 = st.columns(3)
             
             with col1:
@@ -1924,15 +2266,43 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
                 st.caption("Límite inferior (profit = 0)")
             
             with col2:
-                st.markdown("### ⭐ ÓPTIMO")
-                st.metric("Recomendado", f"${optimal_budget_val:,.0f}")
-                st.caption(f"Profit máximo: ${optimal_profit_val:,.0f}")
+                if is_limited:
+                    st.markdown("### ⚠️ LIMITADO")
+                    st.metric("Mejor dentro del límite", f"${optimal_budget_val:,.0f}")
+                    st.caption(f"⚠️ El óptimo real puede ser mayor")
+                else:
+                    st.markdown("### ⭐ ÓPTIMO")
+                    st.metric("Recomendado", f"${optimal_budget_val:,.0f}")
+                    st.caption(f"Profit máximo: ${optimal_profit_val:,.0f}")
             
             with col3:
-                st.markdown("### 📈 Máximo")
-                conservador = optimal_budget_val * 1.2
-                st.metric("Límite conservador", f"${conservador:,.0f}")
-                st.caption("+20% del óptimo")
+                if is_limited:
+                    st.markdown("### 💡 Sugerencia")
+                    st.metric("Presupuesto máximo", f"${max_budget_analysis:,.0f}")
+                    st.caption("Considera aumentarlo")
+                else:
+                    st.markdown("### 📈 Máximo")
+                    st.metric("Límite conservador", f"${conservador:,.0f}")
+                    st.caption("+20% del óptimo")
+            
+            # Generar guías según si está limitado o no
+            if is_limited:
+                guias_texto = f"""
+            **Guías de presupuesto (⚠️ LIMITADO por máximo ${max_budget_analysis:,.0f}):**
+            - ⚠️ **Menos de ${break_even_budget:,.0f} USD:** Pierdes dinero
+            - ✅ **${break_even_budget:,.0f} - ${optimal_budget_val:,.0f} USD:** Profit crece
+            - ⭐ **${optimal_budget_val:,.0f} USD:** Mejor resultado dentro del límite
+            - 💡 **El óptimo real puede estar más arriba** - considera aumentar el presupuesto máximo
+            """
+            else:
+                guias_texto = f"""
+            **Guías de presupuesto:**
+            - ⚠️ **Menos de ${break_even_budget:,.0f} USD:** Pierdes dinero
+            - ✅ **${break_even_budget:,.0f} - ${optimal_budget_val:,.0f} USD:** Profit crece (zona óptima)
+            - ⭐ **${optimal_budget_val:,.0f} USD:** Máximo profit posible
+            - 📉 **Más de ${optimal_budget_val:,.0f} USD:** Profit empieza a decrecer
+            - ❌ **Más de ${conservador:,.0f} USD:** Desperdicio significativo de presupuesto
+            """
             
             st.success(f"""
             ### ✅ Recomendación para {selected_client}:
@@ -1944,20 +2314,13 @@ elif page == "📉 Encontrar Presupuesto Óptimo":
             - 📊 ROI: {optimal_roi_val:.1f}%
             - 🎯 ROAS: {optimal_roas_val:.2f}x (cada $1 invertido genera ${optimal_roas_val:.2f} de revenue)
             - 🛒 Transacciones incrementales: ~{optimal_distribution['trans']:.0f}/semana
-            
-            **Guías de presupuesto:**
-            - ⚠️ **Menos de ${break_even_budget:,.0f} USD:** Pierdes dinero
-            - ✅ **${break_even_budget:,.0f} - ${optimal_budget_val:,.0f} USD:** Profit crece (zona óptima)
-            - ⭐ **${optimal_budget_val:,.0f} USD:** Máximo profit posible
-            - 📉 **Más de ${optimal_budget_val:,.0f} USD:** Profit empieza a decrecer
-            - ❌ **Más de ${conservador:,.0f} USD:** Desperdicio significativo de presupuesto
+            {guias_texto}
             """)
             
             st.info(f"""
             **Datos técnicos del análisis:**
             - ✅ Ticket promedio: ${ticket_usd:.2f} USD
             - ✅ Transacciones: Solo **incrementales** (sin baseline orgánico)
-            - ✅ Rango analizado: $0 - ${max_budget_analysis:,.0f} USD
             - ✅ Búsqueda óptimo: Grid search $50 + refinamiento $10 (determinístico)
             - ✅ Curva saturación: 150 puntos usando SLSQP (optimizador gradient-based)
             - ✅ Distribución META/GADS: Basada en curvas de respuesta Hill
