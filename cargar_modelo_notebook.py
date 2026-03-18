@@ -51,7 +51,7 @@ print(parametros)
 
 # 4. Cargar atribución
 print("\n4️⃣ Cargando atribución incremental...")
-atribucion = pd.read_csv("atribucion_incremental.csv")
+atribucion = pd.read_csv("atribucion_incremental_anonimizado.csv")
 print(f"   Atribución cargada: {atribucion.shape}")
 
 # 5. Obtener empresas únicas

@@ -111,7 +111,7 @@ Si quieres regenerar los archivos desde cero:
    - Genera: `dataset_limpio_sin_multicolinealidad.csv`, `modelo_features.csv`
 
 2. **Ejecutar Notebook 2**: `2_Modelo_MMM.ipynb`
-   - Genera: `modelo_notebook2.pkl`, `atribucion_incremental.csv`
+   - Genera: `modelo_notebook2.pkl`, `atribucion_incremental_anonimizado.csv`
 
 3. **Ejecutar Notebook 3**: `3_Curvas_Respuesta_Optimizacion.ipynb`
    - Genera: `curvas_hill_por_cliente.pkl`

@@ -51,7 +51,7 @@ El script `EJECUTAR_AQUI.sh` hace **3 pasos importantes**:
 - ✅ `modelo_notebook2.pkl` - Modelo MMM entrenado
 - ✅ `curvas_hill_por_cliente.pkl` - Curvas Hill por cliente
 - ✅ `dataset_limpio_sin_multicolinealidad.csv` - Dataset limpio
-- ✅ `atribucion_incremental.csv` - Atribución de transacciones
+- ✅ `atribucion_incremental_anonimizado.csv` - Atribución de transacciones
 
 Si alguno falta, el script los genera automáticamente.
 
@@ -67,7 +67,7 @@ El script lo genera automáticamente, pero necesita estos archivos:
 - `metricas_modelo.csv`
 - `coeficientes_modelo.csv`
 - `parametros_modelo.csv`
-- `atribucion_incremental.csv`
+- `atribucion_incremental_anonimizado.csv`
 
 Si no los tienes, ejecuta el notebook `2_Modelo_MMM.ipynb` primero.
 
